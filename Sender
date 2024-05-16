@@ -1,0 +1,131 @@
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+import pymssql
+import configparser
+from datetime import datetime
+#import os
+#import sys
+
+settings = configparser.ConfigParser()
+
+#path = '/'.join(sys.executable.replace('\\', '/').split('/')[:-1])
+#current_directory = pathlib.Path(__file__).parent.absolute() / "settings.ini" #os.path.dirname(__file__) #os.getcwd()
+#current_directory = pathlib.Path(__file__).parent.absolute() / "settings.ini"
+settings_ini_path = 'C:\\Program Files (x86)\\MCMed\\Sender\\settings.ini'
+#settings_ini_path = join(current_directory, 'settings.ini')
+#settings_ini_path = 'C:\Program Files (x86)\MCMed\Sender'
+
+# Получение текущей даты
+current_date = datetime.now().strftime("%Y-%m-%d")
+
+# Создание имени файла с расширением .txt
+file_name = f"C:\\Program Files (x86)\\MCMed\\Sender\\Log\\Log_{current_date}.txt" #os.path.join(current_directory, f'Log/Log_{current_date}.txt') 
+
+#print(settings_ini_path)
+settings.read(settings_ini_path)
+Log_active = settings['LogActive']['log']
+#Подключение к БД через ini
+try:
+    settings.read(settings_ini_path)
+    conn = pymssql.connect(
+        server= settings['DBConnect']['server'],
+        user= settings['DBConnect']['user'],
+        password= settings['DBConnect']['password'], 
+        database= settings['DBConnect']['database'],
+        as_dict=True
+    )
+
+
+
+    #Выгрузка параметров с Емсимеда
+    cursor = conn.cursor()
+    cursor.execute (
+    """ SELECT i.Value AS Server, p1.Value AS Port, p2.Value AS Login, p3.Value AS Password, p4.Value AS Text, p5.Value AS SendDelay
+    FROM GItems i
+    LEFT JOIN GItems p1 ON p1.Code = 'Reports@Connection.Port'
+    LEFT JOIN GItems p2 ON p2.Code = 'Reports@Connection.Login'
+    LEFT JOIN GItems p3 ON p3.Code = 'Reports@Connection.Password'
+    LEFT JOIN GItems p4 ON p4.Code = 'Reports@EmailMessage.Content'
+    LEFT JOIN GItems p5 ON p5.Code = 'Reports@Email.SendDelay'
+    wHERE i.Code ='Reports@Connection.Server'"""
+    )
+    smt_settings = cursor.fetchone()
+
+    #Почтовые настройки
+    smtp_server = smt_settings['Server'] #'smtp.gmail.com'
+    smtp_port = smt_settings['Port'] #587
+    sender_email = smt_settings['Login'] 
+    sender_password = smt_settings['Password'] 
+    sender_text = smt_settings['Text']
+    send_delay = smt_settings['SendDelay']
+
+    #Выгрузка запроса с Емсимеда(RepTitle)
+    cursor.execute ("""SELECT q.Body FROM Queries q WHERE q.QueryName = 'Email_Sender_P'""")
+    sql_data = cursor.fetchone()
+    sqlq = sql_data['Body']
+
+
+
+    #Получение анализов из БД 
+    cursor.execute(sqlq)
+    recipient_data = cursor.fetchall()
+    if not recipient_data:
+        if Log_active == 'True':
+            with open(file_name, 'a') as file:
+                print(f"{datetime.now()} ---> [Error] ---> Немає списка на відправку!", file=file)
+                print(f"[Error] ---> Немає списка на відправку!")
+        #print("No data found.")
+
+    else:
+        try:
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.starttls()
+                server.login(sender_email, sender_password)
+                for recipient in recipient_data:
+                    recipient_email = recipient['Email']
+                    pdf_bytes = recipient['Body']
+                    pdf_name = recipient['Filename']
+                    ExamID = recipient['ExamReqFileID']
+                    RequestDate = recipient['RequestDate']
+                    RequestNumInt = recipient['RequestNumInt']
+                    #print(recipient_email)
+                    message = MIMEMultipart()
+                    message['Subject'] = 'Результати аналізів за направленням від ' + str(RequestDate)
+                    message['From'] = sender_email 
+                    message['To'] = recipient_email
+                    #print(message['To'])
+                    for email in message['To'].split(','):
+                        print(email)
+                        recipient_email_s = email   
+                        print(recipient_email_s)
+                        #Вложение PDF-файла
+                        pdf_attachment = MIMEApplication(pdf_bytes, Name=pdf_name)
+                        pdf_attachment['Content-Disposition'] = pdf_name                    
+                        message.attach(pdf_attachment)
+                        message.attach(MIMEText(sender_text, 'plain'))
+                        try:
+                            server.sendmail(sender_email, recipient_email_s, message.as_string()) 
+                            cursor.execute(f"UPDATE ExamReqFiles SET SENT = getdate() WHERE ExamReqFileID = '{ExamID}'")
+                            conn.commit()
+                            if Log_active == 'True':
+                                with open(file_name, 'a') as file:
+                                    print(f"{datetime.now()} ---> [Done] ---> Лист успішно відправлено на {recipient_email_s}! Номер направлення {RequestNumInt}", file=file)
+                        except Exception as f:
+                            if Log_active == 'True':
+                                with open(file_name, 'a') as file:
+                                    print(f"{datetime.now()} ---> [Error] ---> Помилка при відправці листа на {recipient_email_s}. Номер направлення {RequestNumInt}: {f}", file=file)
+        except Exception as e:
+            if Log_active == True:
+                with open(file_name, 'a') as file:
+                    print(f"{datetime.now()} ---> [Error] ---> Помилка підключення до SMTP!", file=file)
+        finally: 
+            cursor.close()
+            conn.close()
+except Exception as e:
+    print(f"[Conn] ---> Помилка підключення до БД!")
+    if Log_active == True:
+        with open(file_name, 'a') as file:
+            print(f"{datetime.now()} ---> [Conn] ---> Помилка підключення до БД!", file=file)
+
